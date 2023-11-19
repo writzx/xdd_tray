@@ -36,6 +36,11 @@ unsafe extern "system" fn enum_window(window: HWND, _: LPARAM) -> BOOL {
     let text = String::from_utf16_lossy(&text[..len as usize]);
 
     if text.as_str() == "Guild Wars 2" {
+        (API.assume_init().log)(
+            ELogLevel::INFO,
+            b"found window, minimizing.\0".as_ptr() as _,
+        );
+
         PostMessageW(
             window,
             WM_SYSCOMMAND,
@@ -52,11 +57,6 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
     API.write(&api);
 
     unsafe extern "C" fn shortcut_callback(_: *const i8) {
-        (API.assume_init().log)(
-            ELogLevel::INFO,
-            b"found window, minimizing.\0".as_ptr() as _,
-        );
-
         EnumWindows(Some(enum_window), LPARAM(0)).ok();
     }
 
