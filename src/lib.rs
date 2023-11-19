@@ -54,7 +54,7 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
     unsafe extern "C" fn shortcut_callback(_: *const i8) {
         (API.assume_init().log)(
             ELogLevel::INFO,
-            b"testing log not found\0".as_ptr() as _,
+            b"found window, minimizing.\0".as_ptr() as _,
         );
 
         EnumWindows(Some(enum_window), LPARAM(0));
