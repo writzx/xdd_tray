@@ -57,10 +57,10 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
             b"found window, minimizing.\0".as_ptr() as _,
         );
 
-        EnumWindows(Some(enum_window), LPARAM(0));
+        EnumWindows(Some(enum_window), LPARAM(0)).ok();
     }
 
-    (api.register_keybind_with_string)("KB_TRAYIZE\0" as *const _ as _, shortcut_callback, "F3\0" as *const _ as _);
+    (api.register_keybind_with_string)("KB_TRAYIZE\0" as *const _ as _, shortcut_callback, "ALT+Q\0" as *const _ as _);
 }
 
 unsafe extern "C" fn unload() {
