@@ -1,8 +1,13 @@
-use std::ffi::{c_char};
-use std::mem::MaybeUninit;
+use std::ffi::{c_char, c_void, CString};
+use std::sync::OnceLock;
 use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
+
+pub fn mk_str(str: &str) -> *const c_char {
+    let c_str = CString::new(str).unwrap();
+    return c_str.as_ptr() as *const c_char;
+}
 
 #[no_mangle]
 pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
@@ -28,41 +33,113 @@ pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     &AD as *const _ as _
 }
 
-static mut API: MaybeUninit<&'static AddonAPI> = MaybeUninit::uninit();
+static mut API: OnceLock<AddonAPI> = OnceLock::new();
+static WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
 
-unsafe extern "system" fn enum_window(window: HWND, _: LPARAM) -> BOOL {
-    let mut text: [u16; 512] = [0; 512];
-    let len = GetWindowTextW(window, &mut text);
-    let text = String::from_utf16_lossy(&text[..len as usize]);
+const DEBUG: bool = true;
 
-    if text.as_str() == "Guild Wars 2" {
-        (API.assume_init().log)(
-            ELogLevel::INFO,
-            b"found window, minimizing.\0".as_ptr() as _,
-        );
-
-        PostMessageW(
-            window,
-            WM_SYSCOMMAND,
-            WPARAM(SC_MINIMIZE as _),
-            LPARAM(0 as _),
-        ).ok();
+pub unsafe fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
+    if is_debug && !DEBUG {
+        return;
     }
+    if let Some(api) = API.get() {
+        (api.log)(
+            a_log_level,
+            mk_str(a_str),
+        );
+    }
+}
 
-    true.into()
+macro_rules! log {
+    ($a: expr, $b: expr) => {
+        log($a, $b, false)
+    };
+    ($a: expr, $b: expr, $c: expr) => {
+        log($a, $b, $c)
+    };
+}
+
+pub unsafe fn hide_window(hwnd: HWND) {
+    log!(ELogLevel::TRACE, "hiding main window");
+    if PostMessageW(
+        hwnd,
+        WM_SYSCOMMAND,
+        WPARAM(SC_MINIMIZE as _),
+        LPARAM(0 as _),
+    ).is_err() {
+        log!(ELogLevel::WARNING, "could not hide main window");
+    }
+}
+
+unsafe extern "C" fn trayize_bind_callback(_: *const i8) {
+    if let Some(h) = WINDOW_HANDLE.get() {
+        hide_window(*h);
+    }
+}
+
+unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
+    log!(ELogLevel::TRACE, "received window handle callback");
+    let Some(_) = WINDOW_HANDLE.get() else {
+        log!(ELogLevel::TRACE, "setting global window handle");
+        if WINDOW_HANDLE.set(HWND(hwnd as isize)).is_err() {
+            log!(ELogLevel::CRITICAL, "unable to set window handle");
+            return;
+        }
+
+        log!(ELogLevel::TRACE, "unregistering wnd_proc");
+        if let Some(api) = API.get() {
+            (api.unregister_wnd_proc)(window_procedure);
+        }
+        return;
+    };
 }
 
 unsafe extern "C" fn load(a_api: *mut AddonAPI) {
-    let api = &*a_api;
-    API.write(&api);
-
-    unsafe extern "C" fn shortcut_callback(_: *const i8) {
-        EnumWindows(Some(enum_window), LPARAM(0)).ok();
+    if API.set(*a_api).is_err() {
+        log!(ELogLevel::CRITICAL, "unable to set api context");
+        // panic!("unable to set api context");
+        return;
     }
 
-    (api.register_keybind_with_string)("KB_TRAYIZE\0" as *const _ as _, shortcut_callback, "ALT+Q\0" as *const _ as _);
+    log!(ELogLevel::TRACE, "loaded addon");
+
+    log!(ELogLevel::TRACE, "set global api context");
+
+    if let Some(api) = API.get() {
+        (api.register_keybind_with_string)(
+            "KB_TRAYIZE\0" as *const _ as _,
+            trayize_bind_callback,
+            "ALT+Q\0" as *const _ as _,
+        );
+
+        (api.register_wnd_proc)(window_procedure);
+
+        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+    }
+}
+
+unsafe extern "C" fn window_procedure(
+    h_wnd: *mut c_void,
+    u_msg: u32,
+    w_param: usize,
+    l_param: isize,
+) -> u32 {
+    if let Some(api) = API.get() {
+        log!(ELogLevel::TRACE, "raising window handle event");
+        (api.raise_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, h_wnd);
+    }
+
+    &DefWindowProcW(
+        HWND(h_wnd as isize),
+        u_msg,
+        WPARAM(w_param as _),
+        LPARAM(l_param as _),
+    ) as *const _ as _
 }
 
 unsafe extern "C" fn unload() {
-    (API.assume_init().unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
+    log!(ELogLevel::TRACE, "unloading the addon");
+    if let Some(api) = API.get() {
+        (api.unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
+    }
 }

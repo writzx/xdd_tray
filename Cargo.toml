@@ -7,12 +7,6 @@ edition = "2021"
 name = "xdd_tray"
 crate-type = ["cdylib"]
 
-[dependencies]
-
-[dependencies.once_cell]
-version = "1.18.0"
-features = []
-
 [dependencies.windows]
 version = "0.52.0"
 features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"]
