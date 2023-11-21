@@ -4,10 +4,22 @@ use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
 
-pub fn mk_str(str: &str) -> *const c_char {
-    let c_str = CString::new(str).unwrap();
-    return c_str.as_ptr() as *const c_char;
+pub unsafe fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
+    let raw_strs: [*mut c_char; N] = str.map(|v| {
+        CString::new(v).unwrap().into_raw()
+    });
+
+    let c_strs: [*const c_char; N] = raw_strs.map(|v| {
+        v as *const c_char
+    });
+
+    f(&c_strs);
+
+    for raw_str in raw_strs {
+        let _ = CString::from_raw(raw_str as *mut c_char);
+    }
 }
+
 
 #[no_mangle]
 pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
@@ -42,11 +54,14 @@ pub unsafe fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
     if is_debug && !DEBUG {
         return;
     }
+
     if let Some(api) = API.get() {
-        (api.log)(
-            a_log_level,
-            mk_str(a_str),
-        );
+        mk_str(&[a_str], |log_str| {
+            (api.log)(
+                a_log_level,
+                log_str[0],
+            );
+        });
     }
 }
 
