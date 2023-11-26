@@ -1,10 +1,23 @@
+use std::cell::OnceCell;
 use std::ffi::{c_char, c_void, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel};
+use std::time::{Duration, SystemTime};
+use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, EMHStatus};
+use windows::core::HRESULT;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Dxgi::IDXGISwapChain;
 use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
 
-pub unsafe fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
+static mut TRAMPOLINE: OnceCell<unsafe extern "system" fn(
+    this: *mut IDXGISwapChain,
+    sync_interval: u32,
+    flags: u32) -> HRESULT> = OnceCell::new();
+static FRAME_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
+    // pass ownership to C code, which should not modify it
     let raw_strs: [*mut c_char; N] = str.map(|v| {
         CString::new(v).unwrap().into_raw()
     });
@@ -13,10 +26,12 @@ pub unsafe fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char
         v as *const c_char
     });
 
+    // pass to the c function
     f(&c_strs);
 
+    // take ownership back to free
     for raw_str in raw_strs {
-        let _ = CString::from_raw(raw_str as *mut c_char);
+        unsafe { let _ = CString::from_raw(raw_str as *mut c_char); }
     }
 }
 
@@ -50,17 +65,19 @@ static WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
 
 const DEBUG: bool = true;
 
-pub unsafe fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
+pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
     if is_debug && !DEBUG {
         return;
     }
 
-    if let Some(api) = API.get() {
+    if let Some(api) = unsafe { API.get() } {
         mk_str(&[a_str], |log_str| {
-            (api.log)(
-                a_log_level,
-                log_str[0],
-            );
+            unsafe {
+                (api.log)(
+                    a_log_level,
+                    log_str[0],
+                );
+            }
         });
     }
 }
@@ -109,6 +126,37 @@ unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
     };
 }
 
+
+unsafe extern "system" fn new_present_function(this: *mut IDXGISwapChain, sync_interval: u32, flags: u32) -> HRESULT {
+    let frame_time_ns = FRAME_TIME_NS.load(Ordering::Relaxed);
+    if frame_time_ns != 0 {
+        let current_time_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let time_between_last_present_call =
+            current_time_ns - TIME_OF_LAST_PRESENT_NS.load(Ordering::Relaxed);
+        if time_between_last_present_call < frame_time_ns {
+            std::thread::sleep(
+                Duration::from_nanos(
+                    frame_time_ns - time_between_last_present_call
+                )
+            );
+        }
+
+        TIME_OF_LAST_PRESENT_NS.store(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    let trampoline = TRAMPOLINE.get().unwrap();
+    return trampoline(this, sync_interval, flags);
+}
+
 unsafe extern "C" fn load(a_api: *mut AddonAPI) {
     if API.set(*a_api).is_err() {
         log!(ELogLevel::CRITICAL, "unable to set api context");
@@ -130,6 +178,30 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
         (api.register_wnd_proc)(window_procedure);
 
         (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+
+        unsafe {
+            let present_function = (*api.swap_chain).Present as *mut c_void;
+            let mut detoured_func: *mut c_void = std::mem::zeroed();
+
+            if (api.create_hook)(
+                present_function as *mut c_void,
+                new_present_function as *mut c_void,
+                &mut detoured_func,
+            ) != EMHStatus::MhOk {
+                log!(ELogLevel::CRITICAL, "unable to create hook");
+                return;
+            }
+
+            if TRAMPOLINE.set(std::mem::transmute(detoured_func)).is_err() {
+                log!(ELogLevel::CRITICAL, "unable to set trampoline");
+                return;
+            }
+
+            if (api.enable_hook)(present_function as *mut c_void) != EMHStatus::MhOk {
+                log!(ELogLevel::CRITICAL, "unable to enable hook");
+                return;
+            }
+        }
     }
 }
 
