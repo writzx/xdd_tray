@@ -3,10 +3,10 @@ mod mh;
 use std::cell::OnceCell;
 use std::ffi::{c_char, c_void, CString};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64};
 use std::sync::OnceLock;
 
-use std::time::{Duration, SystemTime};
+use minhook_sys::{MH_CreateHook, MH_DisableHook, MH_EnableHook, MH_Initialize, MH_RemoveHook};
 
 use windows::core::{HRESULT, Interface};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -137,7 +137,6 @@ unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
 }
 
 unsafe extern "C" fn new_present_function(this: *mut IDXGISwapChain, sync_interval: u32, flags: u32) -> HRESULT {
-
     log!(ELogLevel::TRACE, "hello from present");
 
     let trampoline = TRAMPOLINE.get().unwrap();
@@ -166,12 +165,24 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
 
         (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
 
+        match unsafe { mh::MH_STATUS::from(MH_Initialize()) } {
+            mh::MH_STATUS::MH_ERROR_ALREADY_INITIALIZED | mh::MH_STATUS::MH_OK => {}
+            status @ mh::MH_STATUS::MH_ERROR_MEMORY_ALLOC => {
+                log!(ELogLevel::CRITICAL, format!("MH_Initialize: {status:?}").as_str());
+                return;
+            }
+            _ => unreachable!(),
+        }
 
         if mh::mh::init(
-            api.create_hook,
-            api.enable_hook,
-            api.disable_hook,
-            api.remove_hook,
+            // api.create_hook,
+            // api.enable_hook,
+            // api.disable_hook,
+            // api.remove_hook,
+            MH_CreateHook,
+            MH_EnableHook,
+            MH_DisableHook,
+            MH_RemoveHook,
         ).is_err() {
             log!(ELogLevel::CRITICAL, "unable to init hooks");
             return;
