@@ -1,20 +1,35 @@
+mod mh;
+
 use std::cell::OnceCell;
 use std::ffi::{c_char, c_void, CString};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+
 use std::time::{Duration, SystemTime};
-use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, EMHStatus};
-use windows::core::HRESULT;
+
+use windows::core::{HRESULT, Interface};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain;
 use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
 
-static mut TRAMPOLINE: OnceCell<unsafe extern "system" fn(
+use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, LPVOID};
+
+static mut PRESENT_HOOK: OnceLock<mh::mh> = OnceLock::new();
+static mut TRAMPOLINE: OnceCell<&'static unsafe extern "system" fn(
     this: *mut IDXGISwapChain,
     sync_interval: u32,
     flags: u32) -> HRESULT> = OnceCell::new();
 static FRAME_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+macro_rules! log {
+    ($a: expr, $b: expr) => {
+        log($a, $b, false)
+    };
+    ($a: expr, $b: expr, $c: expr) => {
+        log($a, $b, $c)
+    };
+}
 
 pub fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
     // pass ownership to C code, which should not modify it
@@ -39,9 +54,11 @@ pub fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) 
 #[no_mangle]
 pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     static AD: AddonDefinition = AddonDefinition {
-        signature: -0x1337,
+        // signature: -0x1337,
+        signature: -0x1338,
         apiversion: nexus_rs::raw_structs::NEXUS_API_VERSION,
-        name: b"xddTray\0".as_ptr() as *const c_char,
+        // name: b"xddTray\0".as_ptr() as *const c_char,
+        name: b"xddTray2\0".as_ptr() as *const c_char,
         version: AddonVersion {
             major: 0,
             minor: 0,
@@ -60,7 +77,7 @@ pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     &AD as *const _ as _
 }
 
-static mut API: OnceLock<AddonAPI> = OnceLock::new();
+static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
 static WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
 
 const DEBUG: bool = true;
@@ -82,15 +99,6 @@ pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
     }
 }
 
-macro_rules! log {
-    ($a: expr, $b: expr) => {
-        log($a, $b, false)
-    };
-    ($a: expr, $b: expr, $c: expr) => {
-        log($a, $b, $c)
-    };
-}
-
 pub unsafe fn hide_window(hwnd: HWND) {
     log!(ELogLevel::TRACE, "hiding main window");
     if PostMessageW(
@@ -106,6 +114,8 @@ pub unsafe fn hide_window(hwnd: HWND) {
 unsafe extern "C" fn trayize_bind_callback(_: *const i8) {
     if let Some(h) = WINDOW_HANDLE.get() {
         hide_window(*h);
+    } else {
+        log!(ELogLevel::CRITICAL, "unable to get window handle");
     }
 }
 
@@ -126,42 +136,19 @@ unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
     };
 }
 
+unsafe extern "C" fn new_present_function(this: *mut IDXGISwapChain, sync_interval: u32, flags: u32) -> HRESULT {
 
-unsafe extern "system" fn new_present_function(this: *mut IDXGISwapChain, sync_interval: u32, flags: u32) -> HRESULT {
-    let frame_time_ns = FRAME_TIME_NS.load(Ordering::Relaxed);
-    if frame_time_ns != 0 {
-        let current_time_ns = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let time_between_last_present_call =
-            current_time_ns - TIME_OF_LAST_PRESENT_NS.load(Ordering::Relaxed);
-        if time_between_last_present_call < frame_time_ns {
-            std::thread::sleep(
-                Duration::from_nanos(
-                    frame_time_ns - time_between_last_present_call
-                )
-            );
-        }
-
-        TIME_OF_LAST_PRESENT_NS.store(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-            Ordering::Relaxed,
-        );
-    }
+    log!(ELogLevel::TRACE, "hello from present");
 
     let trampoline = TRAMPOLINE.get().unwrap();
-    return trampoline(this, sync_interval, flags);
+    trampoline(this, sync_interval, flags)
 }
 
 unsafe extern "C" fn load(a_api: *mut AddonAPI) {
-    if API.set(*a_api).is_err() {
-        log!(ELogLevel::CRITICAL, "unable to set api context");
-        // panic!("unable to set api context");
-        return;
+    if API.set(&*a_api).is_err() {
+        // log!(ELogLevel::CRITICAL, "unable to set api context");
+        panic!("unable to set api context");
+        // return;
     }
 
     log!(ELogLevel::TRACE, "loaded addon");
@@ -179,29 +166,54 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
 
         (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
 
-        unsafe {
-            let present_function = (*api.swap_chain).Present as *mut c_void;
-            let mut detoured_func: *mut c_void = std::mem::zeroed();
 
-            if (api.create_hook)(
-                present_function as *mut c_void,
-                new_present_function as *mut c_void,
-                &mut detoured_func,
-            ) != EMHStatus::MhOk {
-                log!(ELogLevel::CRITICAL, "unable to create hook");
-                return;
-            }
-
-            if TRAMPOLINE.set(std::mem::transmute(detoured_func)).is_err() {
-                log!(ELogLevel::CRITICAL, "unable to set trampoline");
-                return;
-            }
-
-            if (api.enable_hook)(present_function as *mut c_void) != EMHStatus::MhOk {
-                log!(ELogLevel::CRITICAL, "unable to enable hook");
-                return;
-            }
+        if mh::mh::init(
+            api.create_hook,
+            api.enable_hook,
+            api.disable_hook,
+            api.remove_hook,
+        ).is_err() {
+            log!(ELogLevel::CRITICAL, "unable to init hooks");
+            return;
         }
+
+        let swap_chain = IDXGISwapChain::from_raw(api.swap_chain as *mut c_void);
+
+        log!(ELogLevel::TRACE, format!("SWAP CHAIN {:p}", swap_chain.vtable()).as_str());
+
+        let present_function = swap_chain.vtable().Present as *mut LPVOID;
+
+        log!(ELogLevel::TRACE, format!("PRESENT {:p}", present_function as *mut LPVOID).as_str());
+        log!(ELogLevel::TRACE, format!("NEW PRESENT {:p}", new_present_function as *mut LPVOID).as_str());
+
+
+        let new_hook = mh::mh::new(present_function as *mut _, new_present_function as *mut _);
+
+        let Ok(hook_present) = new_hook else {
+            log!(ELogLevel::CRITICAL, format!("unable to create hook: {:?}", new_hook.err().unwrap()).as_str());
+            return;
+        };
+        log!(ELogLevel::TRACE, "hooked swap chain present");
+
+        if TRAMPOLINE.set(std::mem::transmute(hook_present.trampoline())).is_err() {
+            log!(ELogLevel::CRITICAL, "unable to set trampoline");
+            return;
+        }
+        log!(ELogLevel::TRACE, "trampoline was set");
+
+        let enabled = hook_present.enable();
+
+        let Ok(()) = enabled else {
+            log!(ELogLevel::CRITICAL, format!("unable to enable hook: {:?}", enabled.err().unwrap()).as_str());
+            return;
+        };
+        log!(ELogLevel::TRACE, "swap chain present hook enabled");
+
+        if PRESENT_HOOK.set(hook_present).is_err() {
+            log!(ELogLevel::CRITICAL, "unable to set global hook");
+            return;
+        }
+        log!(ELogLevel::TRACE, "global hook was set");
     }
 }
 
@@ -228,5 +240,21 @@ unsafe extern "C" fn unload() {
     log!(ELogLevel::TRACE, "unloading the addon");
     if let Some(api) = API.get() {
         (api.unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
+
+        if let (Some(_), Some(hook_present)) = (TRAMPOLINE.get(), PRESENT_HOOK.get()) {
+            let disabled = hook_present.disable();
+
+            let Ok(()) = disabled else {
+                log!(ELogLevel::CRITICAL, format!("unable to disable hook: {:?}", disabled.err().unwrap()).as_str());
+                return;
+            };
+
+            let removed = hook_present.remove();
+
+            let Ok(()) = removed else {
+                log!(ELogLevel::CRITICAL, format!("unable to remove hook: {:?}", removed.err().unwrap()).as_str());
+                return;
+            };
+        }
     }
 }
