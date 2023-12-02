@@ -22,6 +22,3 @@ features = [
 [dependencies.nexus-rs]
 git = "https://github.com/belst/raidcore_bindings-rs.git"
 version = "0.1.0"
-
-[dependencies.minhook-sys]
-version = "0.1.1"
