@@ -11,7 +11,7 @@ use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags
 
 static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
 
-static mut WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
+static mut WINDOW_HANDLE: OnceLock<&'static HWND> = OnceLock::new();
 
 const DEBUG: bool = true;
 const HIDDEN_FPS_LIMIT: u32 = 3;
@@ -171,7 +171,7 @@ unsafe extern "C" fn window_procedure(
 
 unsafe extern "C" fn trayize(_: *const i8) {
     if let Some(h_wnd) = WINDOW_HANDLE.get() {
-        minimize_with_limiter(*h_wnd);
+        minimize_with_limiter(**h_wnd);
     } else {
         log!(ELogLevel::CRITICAL, "failed to get window handle");
     }
@@ -181,7 +181,7 @@ unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
     log!(ELogLevel::TRACE, "received window handle callback");
     let Some(_) = WINDOW_HANDLE.get() else {
         log!(ELogLevel::TRACE, "setting global window handle");
-        if WINDOW_HANDLE.set(HWND(h_wnd as isize)).is_err() {
+        if WINDOW_HANDLE.set(Box::leak(Box::new(HWND(h_wnd as isize)))).is_err() {
             log!(ELogLevel::CRITICAL, "failed to set window handle");
             return;
         }
@@ -254,4 +254,7 @@ unsafe extern "C" fn unload() {
 
         (api.unregister_render)(limiter);
     }
+    //
+    // API.take();
+    // WINDOW_HANDLE.take();
 }
