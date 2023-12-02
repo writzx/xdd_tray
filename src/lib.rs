@@ -28,7 +28,7 @@ static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! log {
     ($a: expr, $b: expr) => {
-        log($a, $b, false)
+        log($a, $b, ($a as u8) >= (ELogLevel::DEBUG as u8))
     };
     ($a: expr, $b: expr, $c: expr) => {
         log($a, $b, $c)
@@ -47,7 +47,13 @@ macro_rules! fps_to_ns {
     };
 }
 
-pub fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
+macro_rules! set_fps_limit {
+    ($fps: expr) => {
+        FRAME_TIME_NS.store(fps_to_ns!($fps), Ordering::Relaxed);
+    };
+}
+
+pub fn use_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) {
     // pass ownership to C code, which should not modify it
     let raw_strs: [*mut c_char; N] = str.map(|v| {
         CString::new(v).unwrap().into_raw()
@@ -66,15 +72,29 @@ pub fn mk_str<const N: usize>(str: &[&str; N], f: impl Fn(&[*const c_char; N])) 
     }
 }
 
+pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
+    if is_debug && !DEBUG {
+        return;
+    }
+
+    if let Some(api) = unsafe { API.get() } {
+        use_str(&[a_str], |log_str| {
+            unsafe {
+                (api.log)(
+                    a_log_level,
+                    log_str[0],
+                );
+            }
+        });
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     static AD: AddonDefinition = AddonDefinition {
-        // signature: -0x1337,
-        signature: -0x1338,
+        signature: -0x1337,
         apiversion: nexus_rs::raw_structs::NEXUS_API_VERSION,
-        // name: b"xddTray\0".as_ptr() as *const c_char,
-        name: b"xddTray2\0".as_ptr() as *const c_char,
+        name: b"xddTray\0".as_ptr() as *const c_char,
         version: AddonVersion {
             major: 0,
             minor: 0,
@@ -93,42 +113,34 @@ pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     &AD as *const _ as _
 }
 
-pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
-    if is_debug && !DEBUG {
-        return;
-    }
-
-    if let Some(api) = unsafe { API.get() } {
-        mk_str(&[a_str], |log_str| {
-            unsafe {
-                (api.log)(
-                    a_log_level,
-                    log_str[0],
-                );
-            }
-        });
-    }
-}
-
-macro_rules! set_fps_limit {
-    ($fps: expr) => {
-        FRAME_TIME_NS.store(fps_to_ns!($fps), Ordering::Relaxed);
-    };
-}
-
-pub unsafe fn hide_window(hwnd: HWND) {
-    log!(ELogLevel::TRACE, "hiding main window");
-    if PostMessageW(
-        hwnd,
-        WM_SYSCOMMAND,
-        WPARAM(SC_MINIMIZE as _),
-        LPARAM(0 as _),
-    ).is_err() {
-        log!(ELogLevel::WARNING, "could not hide main window");
-        return;
-    }
-
+fn enable_limiter() {
+    log!(ELogLevel::TRACE, "enabling fps limit");
     set_fps_limit!(HIDDEN_FPS_LIMIT);
+}
+
+fn disable_limiter() {
+    log!(ELogLevel::TRACE, "disabling fps limit");
+    set_fps_limit!(0); // disable
+}
+
+pub fn minimize(h_wnd: HWND) {
+    log!(ELogLevel::TRACE, "minimizing main window");
+    if unsafe {
+        PostMessageW(
+            h_wnd,
+            WM_SYSCOMMAND,
+            WPARAM(SC_MINIMIZE as _),
+            LPARAM(0 as _),
+        ).is_err()
+    } {
+        log!(ELogLevel::WARNING, "could not minimize main window");
+        return;
+    }
+}
+
+pub fn minimize_with_limiter(h_wnd: HWND) {
+    minimize(h_wnd);
+    enable_limiter();
 }
 
 unsafe extern "C" fn window_procedure(
@@ -142,7 +154,7 @@ unsafe extern "C" fn window_procedure(
             Some(_) => {}
             _ => {
                 log!(ELogLevel::TRACE, "raising window handle event");
-                (api.raise_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, h_wnd);
+                (api.raise_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, h_wnd);
             }
         }
     }
@@ -153,7 +165,7 @@ unsafe extern "C" fn window_procedure(
                 //     // set_fps_limit!();
                 // }
                 SC_MAXIMIZE | SC_RESTORE => {
-                    set_fps_limit!(0);
+                    disable_limiter();
                 }
                 _ => {}
             }
@@ -164,34 +176,26 @@ unsafe extern "C" fn window_procedure(
     1 // we are not handling it at all
 }
 
-unsafe extern "C" fn enable_limiter(_: *const i8) {
-    set_fps_limit!(30); // 30 fps default
-}
-
-unsafe extern "C" fn disable_limiter(_: *const i8) {
-    set_fps_limit!(0); // disable
-}
-
-unsafe extern "C" fn trayize_bind_callback(_: *const i8) {
-    if let Some(hwnd) = WINDOW_HANDLE.get() {
-        hide_window(*hwnd);
+unsafe extern "C" fn trayize(_: *const i8) {
+    if let Some(h_wnd) = WINDOW_HANDLE.get() {
+        minimize_with_limiter(*h_wnd);
     } else {
         log!(ELogLevel::CRITICAL, "failed to get window handle");
     }
 }
 
-unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
+unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
     log!(ELogLevel::TRACE, "received window handle callback");
     let Some(_) = WINDOW_HANDLE.get() else {
         log!(ELogLevel::TRACE, "setting global window handle");
-        if WINDOW_HANDLE.set(HWND(hwnd as isize)).is_err() {
+        if WINDOW_HANDLE.set(HWND(h_wnd as isize)).is_err() {
             log!(ELogLevel::CRITICAL, "failed to set window handle");
             return;
         }
 
         if let Some(api) = API.get() {
             log!(ELogLevel::TRACE, "unsubscribing from window handle event");
-            (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, window_handle_callback);
+            (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
         }
         return;
     };
@@ -237,26 +241,14 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
 
     if let Some(api) = API.get() {
         (api.register_keybind_with_string)(
-            "KB_TRAYIZE_LIMIT\0" as *const _ as _,
-            trayize_bind_callback,
-            "ALT+P\0" as *const _ as _,
+            "KB_TRAYIZE\0" as *const _ as _,
+            trayize,
+            "ALT+Q\0" as *const _ as _,
         );
 
         (api.register_wnd_proc)(window_procedure);
 
-        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, window_handle_callback);
-
-        (api.register_keybind_with_string)(
-            "KB_ENABLE_LIMITER\0" as *const _ as _,
-            enable_limiter,
-            "ALT+,\0" as *const _ as _,
-        );
-
-        (api.register_keybind_with_string)(
-            "KB_DISABLE_LIMITER\0" as *const _ as _,
-            disable_limiter,
-            "ALT+.\0" as *const _ as _,
-        );
+        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
 
         (api.register_render)(ERenderType::PostRender, limiter);
     }
@@ -265,9 +257,7 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
 unsafe extern "C" fn unload() {
     log!(ELogLevel::TRACE, "unloading the addon");
     if let Some(api) = API.get() {
-        (api.unregister_keybind)("KB_TRAYIZE_LIMIT\0" as *const _ as _);
-        (api.unregister_keybind)("KB_ENABLE_LIMITER\0" as *const _ as _);
-        (api.unregister_keybind)("KB_DISABLE_LIMITER\0" as *const _ as _);
+        (api.unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
 
         (api.unregister_render)(limiter);
     }
