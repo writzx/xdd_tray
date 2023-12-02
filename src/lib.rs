@@ -9,13 +9,6 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SC_MINIMIZE, WM_SYSC
 
 use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, ERenderType};
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub enum EWindowState {
-    Minimized = 0,
-    Maximized = 1,
-}
-
 static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
 
 static mut WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
