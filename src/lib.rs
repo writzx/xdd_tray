@@ -1,13 +1,13 @@
 use std::ffi::{c_char, c_void, CString};
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{OnceLock};
 use std::time::{Duration, SystemTime};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, IsIconic, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND, SC_MAXIMIZE, SC_RESTORE};
 
-use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, ERenderType, KeybindsProcess};
+use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, ERenderType};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -134,20 +134,34 @@ pub unsafe fn hide_window(hwnd: HWND) {
 unsafe extern "C" fn window_procedure(
     h_wnd: *mut c_void,
     u_msg: u32,
-    w_param: usize,
-    l_param: isize,
+    u_param: usize,
+    _: isize,
 ) -> u32 {
     if let Some(api) = API.get() {
-        log!(ELogLevel::TRACE, "raising window handle event");
-        (api.raise_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, h_wnd);
+        match WINDOW_HANDLE.get() {
+            Some(_) => {}
+            _ => {
+                log!(ELogLevel::TRACE, "raising window handle event");
+                (api.raise_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, h_wnd);
+            }
+        }
+    }
+    match u_msg {
+        WM_SYSCOMMAND => {
+            match u_param as u32 {
+                // SC_MINIMIZE => {
+                //     // set_fps_limit!();
+                // }
+                SC_MAXIMIZE | SC_RESTORE => {
+                    set_fps_limit!(0);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 
-    &DefWindowProcW(
-        HWND(h_wnd as isize),
-        u_msg,
-        WPARAM(w_param as _),
-        LPARAM(l_param as _),
-    ) as *const _ as _
+    1 // we are not handling it at all
 }
 
 unsafe extern "C" fn enable_limiter(_: *const i8) {
@@ -176,9 +190,6 @@ unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
         }
 
         if let Some(api) = API.get() {
-            log!(ELogLevel::TRACE, "unregistering wnd_proc");
-            (api.unregister_wnd_proc)(window_procedure);
-
             log!(ELogLevel::TRACE, "unsubscribing from window handle event");
             (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, window_handle_callback);
         }
@@ -257,5 +268,7 @@ unsafe extern "C" fn unload() {
         (api.unregister_keybind)("KB_TRAYIZE_LIMIT\0" as *const _ as _);
         (api.unregister_keybind)("KB_ENABLE_LIMITER\0" as *const _ as _);
         (api.unregister_keybind)("KB_DISABLE_LIMITER\0" as *const _ as _);
+
+        (api.unregister_render)(limiter);
     }
 }
