@@ -1,33 +1,49 @@
-mod mh;
-
-use std::cell::OnceCell;
 use std::ffi::{c_char, c_void, CString};
 
-use std::sync::atomic::{AtomicU64};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
-use minhook_sys::{MH_CreateHook, MH_DisableHook, MH_EnableHook, MH_Initialize, MH_RemoveHook};
-
-use windows::core::{HRESULT, Interface};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Dxgi::IDXGISwapChain;
-use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
+use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, IsIconic, PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND};
 
-use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, LPVOID};
+use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, ERenderType, KeybindsProcess};
 
-static mut PRESENT_HOOK: OnceLock<mh::mh> = OnceLock::new();
-static mut TRAMPOLINE: OnceCell<&'static unsafe extern "system" fn(
-    this: *mut IDXGISwapChain,
-    sync_interval: u32,
-    flags: u32) -> HRESULT> = OnceCell::new();
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum EWindowState {
+    Minimized = 0,
+    Maximized = 1,
+}
+
+static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
+
+static mut WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
+
+const DEBUG: bool = true;
+const HIDDEN_FPS_LIMIT: u32 = 3;
+
 static FRAME_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
 macro_rules! log {
     ($a: expr, $b: expr) => {
         log($a, $b, false)
     };
     ($a: expr, $b: expr, $c: expr) => {
         log($a, $b, $c)
+    };
+}
+
+macro_rules! fps_to_ns {
+    ($fps: expr) => {
+        match $fps {
+            0 => 0,
+            _ => ((1f64 / $fps as f64)
+                * 1000f64
+                * 1000f64
+                * 1000f64) as u64
+        }
     };
 }
 
@@ -77,11 +93,6 @@ pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     &AD as *const _ as _
 }
 
-static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
-static WINDOW_HANDLE: OnceLock<HWND> = OnceLock::new();
-
-const DEBUG: bool = true;
-
 pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
     if is_debug && !DEBUG {
         return;
@@ -99,6 +110,12 @@ pub fn log(a_log_level: ELogLevel, a_str: &str, is_debug: bool) {
     }
 }
 
+macro_rules! set_fps_limit {
+    ($fps: expr) => {
+        FRAME_TIME_NS.store(fps_to_ns!($fps), Ordering::Relaxed);
+    };
+}
+
 pub unsafe fn hide_window(hwnd: HWND) {
     log!(ELogLevel::TRACE, "hiding main window");
     if PostMessageW(
@@ -108,124 +125,10 @@ pub unsafe fn hide_window(hwnd: HWND) {
         LPARAM(0 as _),
     ).is_err() {
         log!(ELogLevel::WARNING, "could not hide main window");
-    }
-}
-
-unsafe extern "C" fn trayize_bind_callback(_: *const i8) {
-    if let Some(h) = WINDOW_HANDLE.get() {
-        hide_window(*h);
-    } else {
-        log!(ELogLevel::CRITICAL, "unable to get window handle");
-    }
-}
-
-unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
-    log!(ELogLevel::TRACE, "received window handle callback");
-    let Some(_) = WINDOW_HANDLE.get() else {
-        log!(ELogLevel::TRACE, "setting global window handle");
-        if WINDOW_HANDLE.set(HWND(hwnd as isize)).is_err() {
-            log!(ELogLevel::CRITICAL, "unable to set window handle");
-            return;
-        }
-
-        log!(ELogLevel::TRACE, "unregistering wnd_proc");
-        if let Some(api) = API.get() {
-            (api.unregister_wnd_proc)(window_procedure);
-        }
         return;
-    };
-}
-
-unsafe extern "C" fn new_present_function(this: *mut IDXGISwapChain, sync_interval: u32, flags: u32) -> HRESULT {
-    log!(ELogLevel::TRACE, "hello from present");
-
-    let trampoline = TRAMPOLINE.get().unwrap();
-    trampoline(this, sync_interval, flags)
-}
-
-unsafe extern "C" fn load(a_api: *mut AddonAPI) {
-    if API.set(&*a_api).is_err() {
-        // log!(ELogLevel::CRITICAL, "unable to set api context");
-        panic!("unable to set api context");
-        // return;
     }
 
-    log!(ELogLevel::TRACE, "loaded addon");
-
-    log!(ELogLevel::TRACE, "set global api context");
-
-    if let Some(api) = API.get() {
-        (api.register_keybind_with_string)(
-            "KB_TRAYIZE\0" as *const _ as _,
-            trayize_bind_callback,
-            "ALT+Q\0" as *const _ as _,
-        );
-
-        (api.register_wnd_proc)(window_procedure);
-
-        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
-
-        match unsafe { mh::MH_STATUS::from(MH_Initialize()) } {
-            mh::MH_STATUS::MH_ERROR_ALREADY_INITIALIZED | mh::MH_STATUS::MH_OK => {}
-            status @ mh::MH_STATUS::MH_ERROR_MEMORY_ALLOC => {
-                log!(ELogLevel::CRITICAL, format!("MH_Initialize: {status:?}").as_str());
-                return;
-            }
-            _ => unreachable!(),
-        }
-
-        if mh::mh::init(
-            // api.create_hook,
-            // api.enable_hook,
-            // api.disable_hook,
-            // api.remove_hook,
-            MH_CreateHook,
-            MH_EnableHook,
-            MH_DisableHook,
-            MH_RemoveHook,
-        ).is_err() {
-            log!(ELogLevel::CRITICAL, "unable to init hooks");
-            return;
-        }
-
-        let swap_chain = IDXGISwapChain::from_raw(api.swap_chain as *mut c_void);
-
-        log!(ELogLevel::TRACE, format!("SWAP CHAIN {:p}", swap_chain.vtable()).as_str());
-
-        let present_function = swap_chain.vtable().Present as *mut LPVOID;
-
-        log!(ELogLevel::TRACE, format!("PRESENT {:p}", present_function as *mut LPVOID).as_str());
-        log!(ELogLevel::TRACE, format!("NEW PRESENT {:p}", new_present_function as *mut LPVOID).as_str());
-
-
-        let new_hook = mh::mh::new(present_function as *mut _, new_present_function as *mut _);
-
-        let Ok(hook_present) = new_hook else {
-            log!(ELogLevel::CRITICAL, format!("unable to create hook: {:?}", new_hook.err().unwrap()).as_str());
-            return;
-        };
-        log!(ELogLevel::TRACE, "hooked swap chain present");
-
-        if TRAMPOLINE.set(std::mem::transmute(hook_present.trampoline())).is_err() {
-            log!(ELogLevel::CRITICAL, "unable to set trampoline");
-            return;
-        }
-        log!(ELogLevel::TRACE, "trampoline was set");
-
-        let enabled = hook_present.enable();
-
-        let Ok(()) = enabled else {
-            log!(ELogLevel::CRITICAL, format!("unable to enable hook: {:?}", enabled.err().unwrap()).as_str());
-            return;
-        };
-        log!(ELogLevel::TRACE, "swap chain present hook enabled");
-
-        if PRESENT_HOOK.set(hook_present).is_err() {
-            log!(ELogLevel::CRITICAL, "unable to set global hook");
-            return;
-        }
-        log!(ELogLevel::TRACE, "global hook was set");
-    }
+    set_fps_limit!(HIDDEN_FPS_LIMIT);
 }
 
 unsafe extern "C" fn window_procedure(
@@ -236,7 +139,7 @@ unsafe extern "C" fn window_procedure(
 ) -> u32 {
     if let Some(api) = API.get() {
         log!(ELogLevel::TRACE, "raising window handle event");
-        (api.raise_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, h_wnd);
+        (api.raise_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, h_wnd);
     }
 
     &DefWindowProcW(
@@ -247,25 +150,112 @@ unsafe extern "C" fn window_procedure(
     ) as *const _ as _
 }
 
+unsafe extern "C" fn enable_limiter(_: *const i8) {
+    set_fps_limit!(30); // 30 fps default
+}
+
+unsafe extern "C" fn disable_limiter(_: *const i8) {
+    set_fps_limit!(0); // disable
+}
+
+unsafe extern "C" fn trayize_bind_callback(_: *const i8) {
+    if let Some(hwnd) = WINDOW_HANDLE.get() {
+        hide_window(*hwnd);
+    } else {
+        log!(ELogLevel::CRITICAL, "failed to get window handle");
+    }
+}
+
+unsafe extern "C" fn window_handle_callback(hwnd: *mut c_void) {
+    log!(ELogLevel::TRACE, "received window handle callback");
+    let Some(_) = WINDOW_HANDLE.get() else {
+        log!(ELogLevel::TRACE, "setting global window handle");
+        if WINDOW_HANDLE.set(HWND(hwnd as isize)).is_err() {
+            log!(ELogLevel::CRITICAL, "failed to set window handle");
+            return;
+        }
+
+        if let Some(api) = API.get() {
+            log!(ELogLevel::TRACE, "unregistering wnd_proc");
+            (api.unregister_wnd_proc)(window_procedure);
+
+            log!(ELogLevel::TRACE, "unsubscribing from window handle event");
+            (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, window_handle_callback);
+        }
+        return;
+    };
+}
+
+unsafe extern "C" fn limiter() {
+    let frame_time_ns = FRAME_TIME_NS.load(Ordering::Relaxed);
+    if frame_time_ns != 0 {
+        let current_time_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let time_between_last_present_call =
+            current_time_ns - TIME_OF_LAST_PRESENT_NS.load(Ordering::Relaxed);
+        if time_between_last_present_call < frame_time_ns {
+            std::thread::sleep(
+                Duration::from_nanos(
+                    frame_time_ns - time_between_last_present_call
+                )
+            );
+        }
+
+        TIME_OF_LAST_PRESENT_NS.store(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+unsafe extern "C" fn load(a_api: *mut AddonAPI) {
+    if API.set(&*a_api).is_err() {
+        // log!(ELogLevel::CRITICAL, "failed to set api context");
+        panic!("failed to set api context");
+        // return;
+    }
+
+    log!(ELogLevel::TRACE, "loaded addon");
+
+    log!(ELogLevel::TRACE, "set global api context");
+
+    if let Some(api) = API.get() {
+        (api.register_keybind_with_string)(
+            "KB_TRAYIZE_LIMIT\0" as *const _ as _,
+            trayize_bind_callback,
+            "ALT+P\0" as *const _ as _,
+        );
+
+        (api.register_wnd_proc)(window_procedure);
+
+        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED_2\0" as *const _ as _, window_handle_callback);
+
+        (api.register_keybind_with_string)(
+            "KB_ENABLE_LIMITER\0" as *const _ as _,
+            enable_limiter,
+            "ALT+,\0" as *const _ as _,
+        );
+
+        (api.register_keybind_with_string)(
+            "KB_DISABLE_LIMITER\0" as *const _ as _,
+            disable_limiter,
+            "ALT+.\0" as *const _ as _,
+        );
+
+        (api.register_render)(ERenderType::PostRender, limiter);
+    }
+}
+
 unsafe extern "C" fn unload() {
     log!(ELogLevel::TRACE, "unloading the addon");
     if let Some(api) = API.get() {
-        (api.unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
-
-        if let (Some(_), Some(hook_present)) = (TRAMPOLINE.get(), PRESENT_HOOK.get()) {
-            let disabled = hook_present.disable();
-
-            let Ok(()) = disabled else {
-                log!(ELogLevel::CRITICAL, format!("unable to disable hook: {:?}", disabled.err().unwrap()).as_str());
-                return;
-            };
-
-            let removed = hook_present.remove();
-
-            let Ok(()) = removed else {
-                log!(ELogLevel::CRITICAL, format!("unable to remove hook: {:?}", removed.err().unwrap()).as_str());
-                return;
-            };
-        }
+        (api.unregister_keybind)("KB_TRAYIZE_LIMIT\0" as *const _ as _);
+        (api.unregister_keybind)("KB_ENABLE_LIMITER\0" as *const _ as _);
+        (api.unregister_keybind)("KB_DISABLE_LIMITER\0" as *const _ as _);
     }
 }
