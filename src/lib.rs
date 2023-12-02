@@ -253,5 +253,7 @@ unsafe extern "C" fn unload() {
         (api.unregister_keybind)("KB_TRAYIZE\0" as *const _ as _);
 
         (api.unregister_render)(limiter);
+
+        (api.unregister_wnd_proc)(window_procedure);
     }
 }
