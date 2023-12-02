@@ -254,7 +254,4 @@ unsafe extern "C" fn unload() {
 
         (api.unregister_render)(limiter);
     }
-    //
-    // API.take();
-    // WINDOW_HANDLE.take();
 }
