@@ -1,23 +1,40 @@
+mod wm;
+
+use crate::wm::{WindowManager, WM_WINDOW_STATE};
+
 use std::ffi::{c_char, c_void, CString};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock};
 use std::time::{Duration, SystemTime};
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND, SC_MAXIMIZE, SC_RESTORE};
-
 use nexus_rs::raw_structs::{AddonAPI, AddonDefinition, AddonVersion, EAddonFlags, ELogLevel, ERenderType};
 
 static mut API: OnceLock<&'static AddonAPI> = OnceLock::new();
 
-static mut WINDOW_HANDLE: OnceLock<&'static HWND> = OnceLock::new();
+static mut WM: OnceLock<&mut WindowManager> = OnceLock::new();
 
 const DEBUG: bool = true;
-const HIDDEN_FPS_LIMIT: u32 = 3;
 
 static FRAME_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
+const HIDDEN_FPS_LIMIT: u32 = 3;
+const INACTIVE_FPS_LIMIT: u32 = 15;
+
+/*
+/// default enabled
+static HOTKEY_ENABLE: AtomicBool = AtomicBool::new(true);
+
+/// default enabled
+static HIDDEN_LIMIT_ENABLE: AtomicBool = AtomicBool::new(true);
+
+/// default enabled
+static INACTIVE_LIMIT_ENABLE: AtomicBool = AtomicBool::new(true);
+
+static HIDDEN_FPS: AtomicU16 = AtomicU16::new(3);
+static INACTIVE_FPS: AtomicU16 = AtomicU16::new(15);
+*/
 
 macro_rules! log {
     ($a: expr, $b: expr) => {
@@ -106,92 +123,78 @@ pub extern "C" fn GetAddonDef() -> *mut AddonDefinition {
     &AD as *const _ as _
 }
 
-fn enable_limiter() {
-    log!(ELogLevel::TRACE, "enabling fps limit");
-    set_fps_limit!(HIDDEN_FPS_LIMIT);
-}
-
-fn disable_limiter() {
-    log!(ELogLevel::TRACE, "disabling fps limit");
-    set_fps_limit!(0); // disable
-}
-
-pub fn minimize(h_wnd: HWND) {
-    log!(ELogLevel::TRACE, "minimizing main window");
-    if unsafe {
-        PostMessageW(
-            h_wnd,
-            WM_SYSCOMMAND,
-            WPARAM(SC_MINIMIZE as _),
-            LPARAM(0 as _),
-        ).is_err()
-    } {
-        log!(ELogLevel::WARNING, "could not minimize main window");
-        return;
-    }
-}
-
-pub fn minimize_with_limiter(h_wnd: HWND) {
-    minimize(h_wnd);
-    enable_limiter();
-}
-
 unsafe extern "C" fn window_procedure(
     h_wnd: *mut c_void,
     u_msg: u32,
-    u_param: usize,
-    _: isize,
+    w_param: usize,
+    l_param: isize,
 ) -> u32 {
     if let Some(api) = API.get() {
-        match WINDOW_HANDLE.get() {
-            Some(_) => {}
-            _ => {
-                log!(ELogLevel::TRACE, "raising window handle event");
-                (api.raise_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, h_wnd);
+        if let Some(&mut ref mut wm) = WM.get_mut() {
+            if wm.wnd_proc(u_msg, w_param, l_param) {
+                return 0;
             }
+        } else {
+            log!(ELogLevel::TRACE, "raising window handle event");
+            (api.raise_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, h_wnd);
         }
-    }
-    match u_msg {
-        WM_SYSCOMMAND => {
-            match u_param as u32 {
-                // SC_MINIMIZE => {
-                //     // set_fps_limit!();
-                // }
-                SC_MAXIMIZE | SC_RESTORE => {
-                    disable_limiter();
-                }
-                _ => {}
-            }
-        }
-        _ => {}
     }
 
-    1 // we are not handling it at all
+    1
 }
 
 unsafe extern "C" fn trayize(_: *const i8) {
-    if let Some(h_wnd) = WINDOW_HANDLE.get() {
-        minimize_with_limiter(**h_wnd);
+    if let Some(winman) = WM.get() {
+        log!(ELogLevel::TRACE, "minimizing main window");
+        if winman.minimize().is_err() {
+            log!(ELogLevel::WARNING, "could not minimize main window");
+        }
+
+        log!(ELogLevel::TRACE, "enabling fps limit");
+        set_fps_limit!(HIDDEN_FPS_LIMIT);
     } else {
-        log!(ELogLevel::CRITICAL, "failed to get window handle");
+        log!(ELogLevel::CRITICAL, "failed to get window manager");
     }
 }
 
 unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
     log!(ELogLevel::TRACE, "received window handle callback");
-    let Some(_) = WINDOW_HANDLE.get() else {
-        log!(ELogLevel::TRACE, "setting global window handle");
-        if WINDOW_HANDLE.set(Box::leak(Box::new(HWND(h_wnd as isize)))).is_err() {
-            log!(ELogLevel::CRITICAL, "failed to set window handle");
-            return;
-        }
+    match WM.get() {
+        Some(_) => {}
+        _ => {
+            log!(ELogLevel::TRACE, "setting global window handle");
+            let mut wm = WindowManager::new(h_wnd);
+            wm.on_state_change = Some(window_state_change);
 
-        if let Some(api) = API.get() {
-            log!(ELogLevel::TRACE, "unsubscribing from window handle event");
-            (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+            if WM.set(Box::leak(Box::new(wm))).is_err() {
+                log!(ELogLevel::CRITICAL, "failed to set window handle");
+                return;
+            }
+
+            if let Some(api) = API.get() {
+                log!(ELogLevel::TRACE, "unsubscribing from window handle event");
+                (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+            }
         }
-        return;
-    };
+    }
+}
+
+fn window_state_change(state: WM_WINDOW_STATE) {
+    match state {
+        WM_WINDOW_STATE::MINIMIZED => {
+            log!(ELogLevel::TRACE, "enabling hidden fps limit");
+            set_fps_limit!(HIDDEN_FPS_LIMIT);
+        }
+        WM_WINDOW_STATE::INACTIVE => {
+            log!(ELogLevel::TRACE, "enabling inactive fps limit");
+            set_fps_limit!(INACTIVE_FPS_LIMIT);
+        }
+        WM_WINDOW_STATE::RESTORED | WM_WINDOW_STATE::MAXIMIZED | WM_WINDOW_STATE::ACTIVE => {
+            log!(ELogLevel::TRACE, "disabling fps limit");
+            set_fps_limit!(0); // disable
+        }
+        _ => {}
+    }
 }
 
 unsafe extern "C" fn limiter() {
