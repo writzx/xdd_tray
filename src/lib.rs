@@ -144,10 +144,19 @@ unsafe extern "C" fn window_procedure(
 }
 
 unsafe extern "C" fn trayize(_: *const i8) {
-    if let Some(winman) = WM.get() {
+    if let Some(&mut ref mut winman) = WM.get_mut() {
+        // todo figure out why this combination works
+        if winman.trayize().is_err() {
+            log!(ELogLevel::WARNING, "could not trayize main window");
+        }
+
         log!(ELogLevel::TRACE, "minimizing main window");
         if winman.minimize().is_err() {
             log!(ELogLevel::WARNING, "could not minimize main window");
+        }
+
+        if winman.hide().is_err() {
+            log!(ELogLevel::WARNING, "could not hide main window");
         }
 
         log!(ELogLevel::TRACE, "enabling fps limit");
@@ -189,9 +198,19 @@ fn window_state_change(state: WM_WINDOW_STATE) {
             log!(ELogLevel::TRACE, "enabling inactive fps limit");
             set_fps_limit!(INACTIVE_FPS_LIMIT);
         }
-        WM_WINDOW_STATE::RESTORED | WM_WINDOW_STATE::MAXIMIZED | WM_WINDOW_STATE::ACTIVE => {
+        WM_WINDOW_STATE::ACTIVE => {
             log!(ELogLevel::TRACE, "disabling fps limit");
             set_fps_limit!(0); // disable
+        }
+        WM_WINDOW_STATE::RESTORED | WM_WINDOW_STATE::MAXIMIZED => {
+            log!(ELogLevel::TRACE, "disabling fps limit");
+            set_fps_limit!(0); // disable
+
+            if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                if winman.untrayize().is_err() {
+                    log!(ELogLevel::WARNING, "could not untrayize main window");
+                }
+            }
         }
         _ => {}
     }
