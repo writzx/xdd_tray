@@ -123,11 +123,10 @@ impl WindowManager {
         notify_id.uCallbackMessage = WM_NOTIFY_CALLBACK;
         notify_id.Anonymous.uVersion = NOTIFYICON_VERSION_4;
 
-        notify_id.szTip = sz_string!("Show Guild Wars 2 Window", 128);
+        notify_id.szTip = sz_string!("Guild Wars 2", 128);
 
-        // todo fix
-        // notify_id.szInfoTitle = sz_string!("Guild Wars 2", 64);
-        // notify_id.szInfo = sz_string!("Restore Guild Wars 2 Window", 256);
+        notify_id.szInfoTitle = sz_string!("Guild Wars 2", 64);
+        notify_id.szInfo = sz_string!("Restore and show game window.", 256);
 
         Self {
             handle,
