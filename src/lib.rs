@@ -1,6 +1,6 @@
 mod wm;
 
-use crate::wm::{WindowManager, WM_WINDOW_STATE};
+use crate::wm::{WindowManager, WM_ACTION, WM_WINDOW_STATE};
 
 use std::ffi::{c_char, c_void, CString};
 
@@ -144,23 +144,12 @@ unsafe extern "C" fn window_procedure(
 }
 
 unsafe extern "C" fn trayize(_: *const i8) {
-    if let Some(&mut ref mut winman) = WM.get_mut() {
-        // todo figure out why this combination works
-        if winman.trayize().is_err() {
-            log!(ELogLevel::WARNING, "could not trayize main window");
-        }
-
+    if let Some(winman) = WM.get() {
         log!(ELogLevel::TRACE, "minimizing main window");
+        // general rule - minimize -> hide
         if winman.minimize().is_err() {
             log!(ELogLevel::WARNING, "could not minimize main window");
         }
-
-        if winman.hide().is_err() {
-            log!(ELogLevel::WARNING, "could not hide main window");
-        }
-
-        log!(ELogLevel::TRACE, "enabling fps limit");
-        set_fps_limit!(HIDDEN_FPS_LIMIT);
     } else {
         log!(ELogLevel::CRITICAL, "failed to get window manager");
     }
@@ -174,6 +163,7 @@ unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
             log!(ELogLevel::TRACE, "setting global window handle");
             let mut wm = WindowManager::new(h_wnd);
             wm.on_state_change = Some(window_state_change);
+            wm.on_tray_action = Some(on_tray_action);
 
             if WM.set(Box::leak(Box::new(wm))).is_err() {
                 log!(ELogLevel::CRITICAL, "failed to set window handle");
@@ -188,11 +178,21 @@ unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
     }
 }
 
-fn window_state_change(state: WM_WINDOW_STATE) {
+fn window_state_change(state: WM_WINDOW_STATE, is_self: bool) {
     match state {
         WM_WINDOW_STATE::MINIMIZED => {
             log!(ELogLevel::TRACE, "enabling hidden fps limit");
             set_fps_limit!(HIDDEN_FPS_LIMIT);
+
+            if is_self {
+                if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                    if winman.hide().is_err() {
+                        log!(ELogLevel::WARNING, "could not hide main window");
+                    }
+                } else {
+                    log!(ELogLevel::CRITICAL, "failed to get window manager");
+                }
+            }
         }
         WM_WINDOW_STATE::INACTIVE => {
             log!(ELogLevel::TRACE, "enabling inactive fps limit");
@@ -206,14 +206,59 @@ fn window_state_change(state: WM_WINDOW_STATE) {
             log!(ELogLevel::TRACE, "disabling fps limit");
             set_fps_limit!(0); // disable
 
-            if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
-                if winman.untrayize().is_err() {
-                    log!(ELogLevel::WARNING, "could not untrayize main window");
+            if is_self {
+                if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                    if winman.untrayize().is_err() {
+                        log!(ELogLevel::WARNING, "could not untrayize main window");
+                    }
+                } else {
+                    log!(ELogLevel::CRITICAL, "failed to get window manager");
+                }
+            }
+        }
+        WM_WINDOW_STATE::SHOWN => {
+            if is_self {
+                if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                    if winman.restore().is_err() {
+                        log!(ELogLevel::WARNING, "could not show main window");
+                    }
+                } else {
+                    log!(ELogLevel::CRITICAL, "failed to get window manager");
+                }
+            }
+        }
+        WM_WINDOW_STATE::HIDDEN => {
+            if is_self {
+                if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                    if winman.trayize().is_err() {
+                        log!(ELogLevel::WARNING, "could not trayize main window");
+                    }
+                } else {
+                    log!(ELogLevel::CRITICAL, "failed to get window manager");
                 }
             }
         }
         _ => {}
     }
+}
+
+fn on_tray_action(action: WM_ACTION) -> bool {
+    match action {
+        WM_ACTION::WM_TRAY_CLICK => {
+            if let Some(&mut ref mut winman) = unsafe { WM.get_mut() } {
+                log!(ELogLevel::TRACE, "showing main window");
+                // general rule - show -> restore
+                if winman.show().is_err() {
+                    log!(ELogLevel::WARNING, "could not show main window");
+                }
+                return true;
+            } else {
+                log!(ELogLevel::CRITICAL, "failed to get window manager");
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 unsafe extern "C" fn limiter() {

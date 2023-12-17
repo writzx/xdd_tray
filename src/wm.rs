@@ -41,13 +41,14 @@ use windows::{
                 WM_APP,
                 SW_HIDE,
                 SW_SHOW,
-                ShowWindowAsync,
+                ShowWindowAsync as ShowWindow,
             },
         },
     },
 };
 
 pub(crate) const WM_NOTIFY_CALLBACK: u32 = WM_APP + 0x69;
+pub(crate) const WM_XDD_MESSAGE: u32 = 1337;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum WM_WINDOW_STATE {
@@ -55,8 +56,10 @@ pub(crate) enum WM_WINDOW_STATE {
     MINIMIZED = 1,
     RESTORED = 2,
     MAXIMIZED = 3,
-    ACTIVE = 4,
-    INACTIVE = 5,
+    HIDDEN = 4,
+    SHOWN = 5,
+    ACTIVE = 6,
+    INACTIVE = 7,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -70,15 +73,22 @@ pub(crate) enum WM_ERROR {
     WM_ERROR_HIDE_WINDOW = 7,
 }
 
+pub(crate) enum WM_ACTION {
+    WM_DEFAULT = 0,
+    WM_TRAY_CLICK = 1,
+}
+
 pub(crate) struct WindowManager {
     pub handle: HWND,
     pub state: WM_WINDOW_STATE,
 
     notify_id: NOTIFYICONDATAW,
     pub notify_visible: bool,
+
     pub window_visible: bool,
 
-    pub on_state_change: Option<fn(_: WM_WINDOW_STATE)>,
+    pub on_state_change: Option<fn(_: WM_WINDOW_STATE, _: bool)>,
+    pub on_tray_action: Option<fn(_: WM_ACTION) -> bool>,
 }
 
 macro_rules! sz_string {
@@ -126,6 +136,7 @@ impl WindowManager {
             notify_visible: false,
             window_visible: true,
             on_state_change: None,
+            on_tray_action: None,
         }
     }
 
@@ -135,7 +146,7 @@ impl WindowManager {
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_MINIMIZE as _),
-                LPARAM(0 as _),
+                LPARAM(WM_XDD_MESSAGE as _),
             )
         };
 
@@ -148,7 +159,7 @@ impl WindowManager {
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_MAXIMIZE as _),
-                LPARAM(0 as _),
+                LPARAM(WM_XDD_MESSAGE as _),
             )
         };
 
@@ -161,7 +172,7 @@ impl WindowManager {
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_RESTORE as _),
-                LPARAM(0 as _),
+                LPARAM(WM_XDD_MESSAGE as _),
             )
         };
 
@@ -205,7 +216,7 @@ impl WindowManager {
     pub(crate) fn show(&mut self) -> Result<(), WM_ERROR> {
         if self.window_visible { return Ok(()); }
         let show_win_res = unsafe {
-            ShowWindowAsync(
+            ShowWindow(
                 self.handle,
                 SW_SHOW,
             )
@@ -222,7 +233,7 @@ impl WindowManager {
     pub(crate) fn hide(&mut self) -> Result<(), WM_ERROR> {
         if !self.window_visible { return Ok(()); }
         let hide_win_res = unsafe {
-            ShowWindowAsync(
+            ShowWindow(
                 self.handle,
                 SW_HIDE,
             )
@@ -236,12 +247,12 @@ impl WindowManager {
         }
     }
 
-    fn state(&mut self, value: WM_WINDOW_STATE) {
+    fn state(&mut self, value: WM_WINDOW_STATE, is_self: bool) {
         if value == self.state { return; }
         self.state = value;
 
         if let Some(on_state) = self.on_state_change {
-            on_state(value);
+            on_state(value, is_self);
         }
     }
 
@@ -249,30 +260,33 @@ impl WindowManager {
         match u_msg {
             WM_SYSCOMMAND => {
                 match w_param as u32 {
-                    SC_MAXIMIZE => self.state(WM_WINDOW_STATE::MAXIMIZED),
-                    SC_RESTORE => self.state(WM_WINDOW_STATE::RESTORED),
-                    SC_MINIMIZE => self.state(WM_WINDOW_STATE::MINIMIZED),
+                    SC_MAXIMIZE => self.state(WM_WINDOW_STATE::MAXIMIZED, l_param as u32 == WM_XDD_MESSAGE),
+                    SC_RESTORE => self.state(WM_WINDOW_STATE::RESTORED, l_param as u32 == WM_XDD_MESSAGE),
+                    SC_MINIMIZE => self.state(WM_WINDOW_STATE::MINIMIZED, l_param as u32 == WM_XDD_MESSAGE),
                     _ => {}
                 }
             }
             WM_ACTIVATE => {
                 match w_param as u32 {
-                    WA_CLICKACTIVE | WA_ACTIVE => self.state(WM_WINDOW_STATE::ACTIVE),
-                    WA_INACTIVE => self.state(WM_WINDOW_STATE::INACTIVE),
+                    WA_CLICKACTIVE | WA_ACTIVE => self.state(WM_WINDOW_STATE::ACTIVE, l_param as u32 == WM_XDD_MESSAGE),
+                    WA_INACTIVE => self.state(WM_WINDOW_STATE::INACTIVE, l_param as u32 == WM_XDD_MESSAGE),
                     _ => {}
                 }
             }
             WM_SHOWWINDOW => {
-                if w_param != 0 {
-                    self.restore().ok();
-                    return true;
+                if l_param == 0 { // only handle calls from ShowWindow (for now)
+                    match w_param as u32 {
+                        0 => self.state(WM_WINDOW_STATE::HIDDEN, true),
+                        _ => self.state(WM_WINDOW_STATE::SHOWN, true)
+                    }
                 }
             }
             WM_NOTIFY_CALLBACK => {
                 match lo_word!(l_param as u32) {
                     NIN_SELECT => {
-                        self.show().ok();
-                        return true;
+                        if let Some(on_tray_notify) = self.on_tray_action {
+                            return on_tray_notify(WM_ACTION::WM_TRAY_CLICK);
+                        }
                     }
                     _ => {}
                 }
