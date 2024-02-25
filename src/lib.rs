@@ -4,7 +4,7 @@ use crate::wm::{WindowManager, WM_ACTION, WM_WINDOW_STATE};
 
 use std::ffi::{c_char, c_void, CString};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -18,6 +18,7 @@ const DEBUG: bool = true;
 
 static FRAME_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static TIME_OF_LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_HANDLE_SUBSCRIBED: AtomicBool = AtomicBool::new(false);
 
 const HIDDEN_FPS_LIMIT: u32 = 3;
 const INACTIVE_FPS_LIMIT: u32 = 15;
@@ -131,6 +132,8 @@ unsafe extern "C" fn window_procedure(
 ) -> u32 {
     if let Some(api) = API.get() {
         if let Some(&mut ref mut wm) = WM.get_mut() {
+            unsubscribe_handle_event();
+
             if wm.wnd_proc(u_msg, w_param, l_param) {
                 return 0;
             }
@@ -168,11 +171,6 @@ unsafe extern "C" fn window_handle_callback(h_wnd: *mut c_void) {
             if WM.set(Box::leak(Box::new(wm))).is_err() {
                 log!(ELogLevel::CRITICAL, "failed to set window handle");
                 return;
-            }
-
-            if let Some(api) = API.get() {
-                log!(ELogLevel::TRACE, "unsubscribing from window handle event");
-                (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
             }
         }
     }
@@ -308,9 +306,35 @@ unsafe extern "C" fn load(a_api: *mut AddonAPI) {
 
         (api.register_wnd_proc)(window_procedure);
 
-        (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+        subscribe_handle_event();
 
         (api.register_render)(ERenderType::PostRender, limiter);
+    }
+}
+
+unsafe extern "C" fn subscribe_handle_event() {
+    let subbed = WINDOW_HANDLE_SUBSCRIBED.load(Ordering::Relaxed);
+
+    if !subbed {
+        if let Some(api) = API.get() {
+            log!(ELogLevel::TRACE, "subscribing to window handle event");
+            (api.subscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+
+            WINDOW_HANDLE_SUBSCRIBED.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+unsafe extern "C" fn unsubscribe_handle_event() {
+    let subbed = WINDOW_HANDLE_SUBSCRIBED.load(Ordering::Relaxed);
+
+    if subbed {
+        if let Some(api) = API.get() {
+            log!(ELogLevel::TRACE, "unsubscribing from window handle event");
+            (api.unsubscribe_event)("WINDOW_HANDLE_RECEIVED\0" as *const _ as _, window_handle_callback);
+
+            WINDOW_HANDLE_SUBSCRIBED.store(false, Ordering::Relaxed);
+        }
     }
 }
 
